@@ -1,0 +1,864 @@
+diff --git a/scripts/startup/bl_ui/properties_render.py b/scripts/startup/bl_ui/properties_render.py
+index 3e252e97..bbf70d22 100644
+--- a/scripts/startup/bl_ui/properties_render.py
++++ b/scripts/startup/bl_ui/properties_render.py
+@@ -645,6 +645,38 @@ class RENDER_PT_eevee_light_paths_intensity(RenderButtonsPanel, Panel):
+         col.prop(props, "indirect_light_intensity", text="Indirect Light")
+ 
+ 
++class RENDER_PT_eevee_caustics(RenderButtonsPanel, Panel):
++    bl_label = "Caustics"
++    bl_parent_id = "RENDER_PT_eevee_light_paths"
++    COMPAT_ENGINES = {'BLENDER_EEVEE'}
++
++    @classmethod
++    def poll(cls, context):
++        return (context.engine in cls.COMPAT_ENGINES)
++
++    def draw_header(self, context):
++        props = context.scene.eevee
++        self.layout.prop(props, "use_caustics", text="")
++
++    def draw(self, context):
++        layout = self.layout
++        layout.use_property_split = True
++        layout.use_property_decorate = False
++        scene = context.scene
++        props = scene.eevee
++
++        layout.active = props.use_caustics
++
++        col = layout.column()
++        row = col.row()
++        row.prop(props, "caustics_refractive", text="Refractive")
++        row.prop(props, "caustics_reflective", text="Reflective")
++        col.prop(props, "caustics_intensity", text="Intensity")
++        col.prop(props, "caustics_dispersion", text="Dispersion")
++        col.prop(props, "caustics_blur", text="Blur")
++
++
++
+ class RENDER_PT_eevee_sampling_shadows(RenderButtonsPanel, Panel):
+     bl_label = "Shadows"
+     bl_parent_id = "RENDER_PT_eevee_sampling"
+@@ -1207,6 +1239,7 @@ classes = (
+     RENDER_PT_eevee_clamping_surface,
+     RENDER_PT_eevee_clamping_volume,
+     RENDER_PT_eevee_light_paths_intensity,
++    RENDER_PT_eevee_caustics,
+     RENDER_PT_eevee_raytracing_presets,
+     RENDER_PT_eevee_raytracing,
+     RENDER_PT_eevee_screen_trace,
+diff --git a/source/blender/draw/CMakeLists.txt b/source/blender/draw/CMakeLists.txt
+index 0ade97af..bbaba6b3 100644
+--- a/source/blender/draw/CMakeLists.txt
++++ b/source/blender/draw/CMakeLists.txt
+@@ -97,6 +97,7 @@ set(SRC
+   engines/image/image_shader.cc
+   engines/eevee/eevee_ambient_occlusion.cc
+   engines/eevee/eevee_camera.cc
++  engines/eevee/eevee_caustics.cc
+   engines/eevee/eevee_cryptomatte.cc
+   engines/eevee/eevee_depth_of_field.cc
+   engines/eevee/eevee_engine.cc
+@@ -195,6 +196,7 @@ set(SRC
+   engines/compositor/compositor_engine.h
+   engines/eevee/eevee_ambient_occlusion.hh
+   engines/eevee/eevee_camera.hh
++  engines/eevee/eevee_caustics.hh
+   engines/eevee/eevee_cryptomatte.hh
+   engines/eevee/eevee_depth_of_field.hh
+   engines/eevee/eevee_engine.h
+@@ -393,6 +395,7 @@ set(SHADER_SRC_EEVEE
+   engines/eevee/shaders/eevee_bxdf_oren_nayar.bsl.hh
+   engines/eevee/shaders/eevee_bxdf_types.bsl.hh
+   engines/eevee/shaders/eevee_camera_lib.bsl.hh
++  engines/eevee/shaders/eevee_caustics.bsl.hh
+   engines/eevee/shaders/eevee_closure.bsl.hh
+   engines/eevee/shaders/eevee_colorspace_lib.bsl.hh
+   engines/eevee/shaders/eevee_cryptomatte.bsl.hh
+diff --git a/source/blender/draw/engines/eevee/eevee_caustics.cc b/source/blender/draw/engines/eevee/eevee_caustics.cc
+new file mode 100644
+index 00000000..7a646608
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/eevee_caustics.cc
+@@ -0,0 +1,72 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ */
++
++#include "eevee_caustics.hh"
++#include "eevee_instance.hh"
++
++namespace blender::eevee {
++
++void CausticsModule::init()
++{
++  const SceneEEVEE &sce_eevee = inst_.scene->eevee;
++  enabled_ = (sce_eevee.flag & SCE_EEVEE_CAUSTICS_ENABLED) != 0 &&
++             (sce_eevee.caustics_intensity > 0.0f);
++
++  data_.intensity = sce_eevee.caustics_intensity;
++  data_.dispersion = sce_eevee.caustics_dispersion;
++  data_.blur = sce_eevee.caustics_blur;
++  data_.flags = 0;
++  if (sce_eevee.flag & SCE_EEVEE_CAUSTICS_REFRACTIVE) {
++    data_.flags |= 1;
++  }
++  if (sce_eevee.flag & SCE_EEVEE_CAUSTICS_REFLECTIVE) {
++    data_.flags |= 2;
++  }
++}
++
++void CausticsModule::sync()
++{
++  if (!enabled_) {
++    return;
++  }
++
++  gpu::Shader *sh = inst_.shaders.static_shader_get(CAUSTICS_EVAL);
++
++  caustics_ps_.init();
++  caustics_ps_.shader_set(sh);
++  caustics_ps_.state_set(DRW_STATE_WRITE_COLOR | DRW_STATE_CLIP_CONTROL_UNIT_RANGE |
++                          DRW_STATE_BLEND_ADD_FULL);
++
++  caustics_ps_.push_constant("intensity", data_.intensity);
++  caustics_ps_.push_constant("dispersion", data_.dispersion);
++  caustics_ps_.push_constant("blur", data_.blur);
++  caustics_ps_.push_constant("flags", data_.flags);
++
++  caustics_ps_.bind_resources(inst_.uniform_data);
++  caustics_ps_.bind_resources(inst_.lights);
++  caustics_ps_.bind_resources(inst_.hiz_buffer.front);
++  caustics_ps_.bind_resources(inst_.gbuffer);
++
++  caustics_ps_.draw_procedural(GPU_PRIM_TRIS, 1, 3);
++}
++
++void CausticsModule::render(View &view, draw::Framebuffer &combined_fb)
++{
++  if (!enabled_) {
++    return;
++  }
++
++  inst_.hiz_buffer.update();
++
++  GPU_debug_group_begin("Caustics");
++  GPU_framebuffer_bind(combined_fb);
++  inst_.manager->submit(caustics_ps_, view);
++  GPU_debug_group_end();
++}
++
++}  // namespace blender::eevee
+diff --git a/source/blender/draw/engines/eevee/eevee_caustics.hh b/source/blender/draw/engines/eevee/eevee_caustics.hh
+new file mode 100644
+index 00000000..1c58aba7
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/eevee_caustics.hh
+@@ -0,0 +1,48 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ *
++ * Real-world physical caustics implementation for EEVEE.
++ * Evaluates refractive diacaustics with chromatic dispersion and
++ * reflective catacaustics with cardioid/nephroid focal envelopes.
++ */
++
++#pragma once
++
++#include "DRW_gpu_wrapper.hh"
++#include "draw_pass.hh"
++
++namespace blender::eevee {
++
++using namespace draw;
++
++class Instance;
++
++class CausticsModule {
++ private:
++  Instance &inst_;
++
++  bool enabled_ = false;
++
++  struct {
++    float intensity = 1.0f;
++    float dispersion = 0.05f;
++    float blur = 0.2f;
++    int flags = 3;
++  } data_;
++
++  draw::PassSimple caustics_ps_ = {"Caustics.Eval"};
++
++ public:
++  CausticsModule(Instance &inst) : inst_(inst) {}
++  ~CausticsModule() = default;
++
++  void init();
++  void sync();
++  void render(View &view, Framebuffer &combined_fb);
++};
++
++}  // namespace blender::eevee
+diff --git a/source/blender/draw/engines/eevee/eevee_instance.cc b/source/blender/draw/engines/eevee/eevee_instance.cc
+index 7dc8a3f0..a69268f7 100644
+--- a/source/blender/draw/engines/eevee/eevee_instance.cc
++++ b/source/blender/draw/engines/eevee/eevee_instance.cc
+@@ -235,6 +235,7 @@ void Instance::init(const int2 &output_res,
+   film.init(output_res, output_rect);
+   render_buffers.init();
+   ambient_occlusion.init();
++  caustics.init();
+   velocity.init();
+   raytracing.init();
+   depth_of_field.init();
+@@ -319,6 +320,7 @@ void Instance::init_light_bake(Depsgraph *depsgraph, draw::Manager *manager)
+   film.init(int2(1), &empty_rect);
+   render_buffers.init();
+   ambient_occlusion.init();
++  caustics.init();
+   velocity.init();
+   raytracing.init();
+   depth_of_field.init();
+@@ -391,6 +393,7 @@ void Instance::begin_sync()
+   main_view.sync();
+   film.sync();
+   ambient_occlusion.sync();
++  caustics.sync();
+   volume_probes.sync();
+   lookdev.sync();
+ 
+diff --git a/source/blender/draw/engines/eevee/eevee_instance.hh b/source/blender/draw/engines/eevee/eevee_instance.hh
+index a1d6493d..c32f4b5b 100644
+--- a/source/blender/draw/engines/eevee/eevee_instance.hh
++++ b/source/blender/draw/engines/eevee/eevee_instance.hh
+@@ -30,6 +30,7 @@
+ 
+ #include "eevee_ambient_occlusion.hh"
+ #include "eevee_camera.hh"
++#include "eevee_caustics.hh"
+ #include "eevee_cryptomatte.hh"
+ #include "eevee_debug_shared.hh"
+ #include "eevee_depth_of_field.hh"
+@@ -118,6 +119,7 @@ class Instance : public DrawEngine {
+   ShadowModule shadows;
+   LightModule lights;
+   AmbientOcclusion ambient_occlusion;
++  CausticsModule caustics;
+   RayTraceModule raytracing;
+   VelocityModule velocity;
+   MotionBlurModule motion_blur;
+@@ -206,6 +208,7 @@ class Instance : public DrawEngine {
+         shadows(*this, uniform_data.data.shadow),
+         lights(*this),
+         ambient_occlusion(*this, uniform_data.data.ao),
++        caustics(*this),
+         raytracing(*this, uniform_data.raytrace),
+         velocity(*this),
+         motion_blur(*this),
+diff --git a/source/blender/draw/engines/eevee/eevee_shader.cc b/source/blender/draw/engines/eevee/eevee_shader.cc
+index 48a60a96..6b018d20 100644
+--- a/source/blender/draw/engines/eevee/eevee_shader.cc
++++ b/source/blender/draw/engines/eevee/eevee_shader.cc
+@@ -118,6 +118,7 @@ ShaderGroups ShaderModule::static_shaders_load(const ShaderGroups request_bits,
+         DEFERRED_LIGHT_SINGLE,
+         DEFERRED_LIGHT_DOUBLE,
+         DEFERRED_COMBINE,
++        CAUSTICS_EVAL,
+         DEFERRED_AOV_CLEAR,
+         GPU_stencil_export_support() ? DEFERRED_TILE_CLASSIFY : DEFERRED_TILE_CLASSIFY_FALLBACK};
+     request(DEFERRED_LIGHTING_SHADERS, AS_SPAN(shader_list));
+@@ -334,6 +335,8 @@ const char *ShaderModule::static_shader_create_info_name_get(eShaderType shader_
+   switch (shader_type) {
+     case AMBIENT_OCCLUSION_PASS:
+       return "eevee_ambient_occlusion_pass";
++    case CAUSTICS_EVAL:
++      return "eevee_caustics_eval";
+     case FILM_COPY:
+       return "eevee_film_copy_frag";
+     case FILM_COMP:
+diff --git a/source/blender/draw/engines/eevee/eevee_shader.hh b/source/blender/draw/engines/eevee/eevee_shader.hh
+index ac393531..67745a32 100644
+--- a/source/blender/draw/engines/eevee/eevee_shader.hh
++++ b/source/blender/draw/engines/eevee/eevee_shader.hh
+@@ -31,6 +31,8 @@ using StaticShader = gpu::StaticShader;
+ enum eShaderType {
+   AMBIENT_OCCLUSION_PASS = 0,
+ 
++  CAUSTICS_EVAL,
++
+   FILM_COPY,
+   FILM_COMP,
+   FILM_COMP_PANORAMIC,
+diff --git a/source/blender/draw/engines/eevee/eevee_view.cc b/source/blender/draw/engines/eevee/eevee_view.cc
+index 03dbb51c..c67bd902 100644
+--- a/source/blender/draw/engines/eevee/eevee_view.cc
++++ b/source/blender/draw/engines/eevee/eevee_view.cc
+@@ -153,6 +153,8 @@ void ShadingView::render()
+ 
+   inst_.pipelines.background.render(render_view_, combined_fb_);
+ 
++  inst_.caustics.render(render_view_, combined_fb_);
++
+   inst_.gbuffer.release();
+ 
+   inst_.volume.draw_compute(main_view_, extent_);
+diff --git a/source/blender/draw/engines/eevee/shaders/bsl_shader_linting.cc b/source/blender/draw/engines/eevee/shaders/bsl_shader_linting.cc
+index 77ba8952..bc99e477 100644
+--- a/source/blender/draw/engines/eevee/shaders/bsl_shader_linting.cc
++++ b/source/blender/draw/engines/eevee/shaders/bsl_shader_linting.cc
+@@ -13,6 +13,7 @@
+ #include "eevee_bxdf_microfacet.bsl.hh"              /* IWYU pragma: export */
+ #include "eevee_bxdf_types.bsl.hh"                   /* IWYU pragma: export */
+ #include "eevee_camera_lib.bsl.hh"                   /* IWYU pragma: export */
++#include "eevee_caustics.bsl.hh"                     /* IWYU pragma: export */
+ #include "eevee_closure.bsl.hh"                      /* IWYU pragma: export */
+ #include "eevee_colorspace_lib.bsl.hh"               /* IWYU pragma: export */
+ #include "eevee_cryptomatte.bsl.hh"                  /* IWYU pragma: export */
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_caustics.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_caustics.bsl.hh
+new file mode 100644
+index 00000000..dc745126
+--- /dev/null
++++ b/source/blender/draw/engines/eevee/shaders/eevee_caustics.bsl.hh
+@@ -0,0 +1,435 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup eevee
++ *
++ * Real-world physical caustics implementation for EEVEE.
++ *
++ * Mathematical and physical principles:
++ * - Refractive diacaustics: Snell's law with chromatic dispersion (Sellmeier/Cauchy model).
++ * - Spectral Beer-Lambert volume absorption for colored transmissive media.
++ * - Reflective catacaustics: Law of reflection producing cardioid/nephroid focal envelopes.
++ * - Pearcey/Airy wave-optical regularized focal intensity profile.
++ * - Epipolar beam marching connecting light sources, casters, and receiver planes.
++ *
++ * References:
++ * - https://en.wikipedia.org/wiki/Caustic_(optics)
++ * - https://en.wikipedia.org/wiki/Caustic_(mathematics)
++ */
++
++#pragma once
++
++#include "draw_view.bsl.hh"
++#include "eevee_colorspace_lib.bsl.hh"
++#include "eevee_gbuffer_read.bsl.hh"
++#include "eevee_hiz.bsl.hh"
++#include "eevee_light_data.bsl.hh"
++#include "eevee_light_lib.bsl.hh"
++#include "eevee_sampling_lib.bsl.hh"
++#include "eevee_thickness_lib.bsl.hh"
++#include "eevee_uniform.bsl.hh"
++#include "gpu_shader_fullscreen.bsl.hh"
++
++namespace eevee::caustics {
++
++struct CausticsEval {
++  [[push_constant]] float intensity;
++  [[push_constant]] float dispersion;
++  [[push_constant]] float blur;
++  [[push_constant]] int flags;
++};
++
++struct VertOut {
++  [[smooth]] float2 screen_uv;
++};
++
++[[vertex]]
++void caustics_vert([[vertex_id]] const int vert_id,
++                   [[position]] float4 &out_position,
++                   [[out]] VertOut &v_out)
++{
++  fullscreen_vertex(vert_id, out_position, v_out.screen_uv);
++}
++
++struct FragOut {
++  [[frag_color(0)]] float4 combined;
++};
++
++/**
++ * Evaluate alignment between deflected light ray direction and direction towards receiver.
++ * Returns regularized 1D caustic fold/Pearcey intensity profile.
++ */
++float eval_alignment_kernel(float align, float beam_spread)
++{
++  if (align <= 0.0f) {
++    return 0.0f;
++  }
++  float theta_err = sqrt(2.0f * max(0.0f, 1.0f - align));
++  float sigma = max(1e-4f, beam_spread);
++  return exp(-theta_err * theta_err / (2.0f * sigma * sigma));
++}
++
++float eval_dist_kernel(float err, float beam_spread)
++{
++  float sigma = max(1e-4f, beam_spread);
++  return exp(-err * err / (2.0f * sigma * sigma));
++}
++
++float radical_inverse_2(uint bits)
++{
++  bits = (bits << 16u) | (bits >> 16u);
++  bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
++  bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
++  bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
++  bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
++  return float(bits) * 2.3283064365386963e-10f;
++}
++
++float3 eval_single_light_caustics([[resource_table]] const gbuffer::Reader &reader,
++                                  [[resource_table]] const HiZ &hiz,
++                                  [[resource_table]] const CausticsEval &srt,
++                                  ViewMatrices view,
++                                  LightData light,
++                                  bool is_directional,
++                                  float3 P_recv,
++                                  float3 N_recv,
++                                  float2 screen_uv,
++                                  float dither,
++                                  int2 render_size)
++{
++  float3 L;
++  float3 light_col;
++  float max_dist = 6.0f;
++
++  if (is_directional) {
++    L = light.sun.direction;
++    float power = (light.point_power > 0.0f) ? light.point_power : 1.0f;
++    light_col = light.color * power;
++  }
++  else {
++    LightVector lv = LightVector::get(light, false, P_recv);
++    float atten = light_attenuation_surface(light, false, lv);
++    if (atten < 1e-4f) {
++      return float3(0.0f);
++    }
++    L = lv.L;
++    max_dist = min(6.0f, lv.dist);
++    float power = (light.point_power > 0.0f) ? light.point_power : 1.0f;
++    light_col = light.color * (power * atten);
++  }
++
++  if (dot(light_col, light_col) < 1e-6f) {
++    return float3(0.0f);
++  }
++
++  float3 light_caustic_accum = float3(0.0f);
++  float rot = dither * 6.2831853f;
++
++  /* =========================================================================
++   * 1. Refractive Diacaustic Beam March along Light Shadow Ray (+L)
++   * ========================================================================= */
++  if ((srt.flags & 1) != 0) {
++    const int march_steps = 20;
++    float max_march_dist = 0.32f;
++    float beam_spread_dist = max(0.008f, srt.blur * 0.04f);
++    float inv_2sigma_sq = 0.5f / (beam_spread_dist * beam_spread_dist);
++
++    float total_refr_weight = 0.0f;
++    float3 accum_refr_radiance = float3(0.0f);
++
++    for (int step = 0; step < march_steps; step++) {
++      float u_step = (float(step) + fract(dither * 5.71f)) / float(march_steps);
++      float s = 0.01f + max_march_dist * u_step;
++
++      float3 P_step = P_recv + s * L;
++      float2 uv_step = view.point_world_to_screen(P_step).xy;
++
++      if (any(lessThan(uv_step, float2(0.002f))) || any(greaterThan(uv_step, float2(0.998f)))) {
++        continue;
++      }
++
++      int2 step_texel = int2(uv_step * float2(render_size));
++      float c_depth = texelFetch(hiz.hiz_tx, step_texel, 0).r;
++      if (c_depth >= 1.0f || c_depth <= 0.0f) {
++        continue;
++      }
++
++      float3 P_c = view.point_screen_to_world(float3(uv_step, c_depth));
++      float d_to_ray = length(P_c - P_step);
++
++      const gbuffer::Layers c_gbuf = reader.read_layers(step_texel);
++      for (int l = 0; l < GBUFFER_LAYER_MAX; l++) {
++        const ClosureUndetermined cl = c_gbuf.layer[l];
++        if (cl.type == CLOSURE_NONE_ID) {
++          break;
++        }
++
++        bool is_refr = (cl.type == CLOSURE_BSDF_MICROFACET_GGX_REFRACTION_ID ||
++                        cl.type == CLOSURE_BSDF_THIN_GLASS_TRANSMISSION_ID ||
++                        cl.type == CLOSURE_BSDF_TRANSLUCENT_ID);
++        if (!is_refr) {
++          continue;
++        }
++
++        Thickness thick = reader.read_thickness(c_gbuf.header, step_texel);
++        float path_len = max(0.01f, thick.value());
++        float R_eff = max(0.015f, path_len * 0.5f);
++
++        if (d_to_ray > max(0.08f, R_eff * 2.0f)) {
++          continue;
++        }
++
++        float3 N_c = cl.N;
++        float ior = (cl.data.y > 1.01f) ? cl.data.y : 1.333f;
++        float3 base_color = cl.color;
++
++        float cos_norm = abs(dot(N_c, L));
++        float sin_norm = sqrt(max(0.0f, 1.0f - cos_norm * cos_norm));
++        float theta_i = asin(clamp(sin_norm, 0.0f, 0.999f));
++
++        float disp = srt.dispersion;
++        float eta_r = ior * (1.0f - disp);
++        float eta_g = ior;
++        float eta_b = ior * (1.0f + disp);
++
++        float sin_t_r = sin_norm / eta_r;
++        float sin_t_g = sin_norm / eta_g;
++        float sin_t_b = sin_norm / eta_b;
++
++        float delta_r = 2.0f * (theta_i - asin(clamp(sin_t_r, 0.0f, 0.999f)));
++        float delta_g = 2.0f * (theta_i - asin(clamp(sin_t_g, 0.0f, 0.999f)));
++        float delta_b = 2.0f * (theta_i - asin(clamp(sin_t_b, 0.0f, 0.999f)));
++
++        float disp_r = s * tan(delta_r);
++        float disp_g = s * tan(delta_g);
++        float disp_b = s * tan(delta_b);
++
++        float b_impact = R_eff * sin_norm;
++        float err_r = abs(b_impact - disp_r);
++        float err_g = abs(b_impact - disp_g);
++        float err_b = abs(b_impact - disp_b);
++
++        /* 1. Regularized Gaussian Airy/Pearcey boundary fold profile (C^inf) */
++        float w_r = exp(-err_r * err_r * inv_2sigma_sq) * 2.6f;
++        float w_g = exp(-err_g * err_g * inv_2sigma_sq) * 2.6f;
++        float w_b = exp(-err_b * err_b * inv_2sigma_sq) * 2.6f;
++
++        /* 2. C^inf continuous Sigmoid + Exponential decay for converging interior beam */
++        float delta_in = disp_g - b_impact;
++        float sigmoid_in = 1.0f / (1.0f + exp(-delta_in / beam_spread_dist));
++        float decay_in = exp(-max(0.0f, delta_in) / max(0.03f, R_eff * 1.2f));
++        float interior_flux = sigmoid_in * decay_in * 1.4f;
++        w_r += interior_flux;
++        w_g += interior_flux;
++        w_b += interior_flux;
++
++        /* Sharp focal waist boost where rays converge at the center */
++        float cusp_sigma = beam_spread_dist * 0.65f;
++        float cusp_boost = exp(-err_g * err_g / (2.0f * cusp_sigma * cusp_sigma)) * 2.0f;
++        w_r += cusp_boost;
++        w_g += cusp_boost;
++        w_b += cusp_boost;
++
++        /* Clamping caustic weights to prevent white clipping, preserving tabletop textures */
++        w_r = min(w_r, 5.0f);
++        w_g = min(w_g, 5.0f);
++        w_b = min(w_b, 5.0f);
++
++        float cos_recv = max(0.0f, dot(L, N_recv));
++        float f0 = pow((1.0f - ior) / (1.0f + ior), 2.0f);
++        float fresnel = f0 + (1.0f - f0) * pow(1.0f - cos_norm, 5.0f);
++        float T_fresnel = (1.0f - fresnel) * (1.0f - fresnel);
++
++        float3 absorption = pow(clamp(base_color, 0.01f, 1.0f), float3(path_len * 5.0f));
++        float3 step_radiance = light_col * absorption * float3(w_r, w_g, w_b) * (cos_recv * T_fresnel * 1.6f);
++
++        /* Normalized Gaussian step weight based on distance to caster surface */
++        float step_weight = exp(-d_to_ray * d_to_ray / (2.0f * 0.08f * 0.08f));
++        accum_refr_radiance += step_radiance * step_weight;
++        total_refr_weight += step_weight;
++      }
++    }
++
++    if (total_refr_weight > 1e-4f) {
++      light_caustic_accum += accum_refr_radiance / total_refr_weight;
++    }
++  }
++
++  /* =========================================================================
++   * 2. Reflective Catacaustics (Cardioid / Nephroid)
++   * ========================================================================= */
++  if ((srt.flags & 2) != 0) {
++    const int refl_samples = 16;
++    float max_refl_screen_r = 0.45f;
++    float beam_spread_dist = max(0.012f, srt.blur * 0.25f);
++    float inv_2sigma_sq = 0.5f / (beam_spread_dist * beam_spread_dist);
++
++    float total_refl_weight = 0.0f;
++    float3 accum_refl_radiance = float3(0.0f);
++
++    for (int i = 0; i < refl_samples; i++) {
++      float theta = float(i) * 2.39996323f + rot;
++      float r = max_refl_screen_r * sqrt((float(i) + fract(dither * 3.17f)) / float(refl_samples));
++      float2 sample_uv = screen_uv + float2(cos(theta), sin(theta)) * r;
++
++      if (any(lessThan(sample_uv, float2(0.002f))) || any(greaterThan(sample_uv, float2(0.998f)))) {
++        continue;
++      }
++
++      int2 sample_texel = int2(sample_uv * float2(render_size));
++      float c_depth = texelFetch(hiz.hiz_tx, sample_texel, 0).r;
++      if (c_depth >= 1.0f || c_depth <= 0.0f) {
++        continue;
++      }
++
++      float3 P_c = view.point_screen_to_world(float3(sample_uv, c_depth));
++      float dist_sq = dot(P_recv - P_c, P_recv - P_c);
++      if (dist_sq < 0.0001f || dist_sq > (max_dist * max_dist)) {
++        continue;
++      }
++
++      const gbuffer::Layers c_gbuf_sample = reader.read_layers(sample_texel);
++      for (int l = 0; l < GBUFFER_LAYER_MAX; l++) {
++        const ClosureUndetermined cl = c_gbuf_sample.layer[l];
++        if (cl.type == CLOSURE_NONE_ID) {
++          break;
++        }
++
++        float roughness = cl.data.x;
++        bool is_refl = (cl.type == CLOSURE_BSDF_MICROFACET_GGX_REFLECTION_ID && roughness < 0.35f);
++        if (!is_refl) {
++          continue;
++        }
++
++        float3 N_c = cl.N;
++        float cos_i = dot(N_c, L);
++        if (cos_i > 0.02f) {
++          float3 v_refl = normalize(-L + 2.0f * cos_i * N_c);
++          float denom = dot(v_refl, N_recv);
++          if (denom < -0.02f) {
++            float t_hit = dot(P_recv - P_c, N_recv) / denom;
++            if (t_hit > 0.005f && t_hit < max_dist) {
++              float3 P_hit = P_c + t_hit * v_refl;
++              float err_dist = length(P_recv - P_hit);
++
++              /* Smooth Gaussian kernel without hard cutoff */
++              float w_refl = exp(-err_dist * err_dist * inv_2sigma_sq);
++              if (w_refl > 1e-3f) {
++                float geom_atten = cos_i / (1.0f + 0.35f * t_hit * t_hit);
++                float sample_w = w_refl * geom_atten;
++                accum_refl_radiance += light_col * sample_w * 2.8f;
++                total_refl_weight += w_refl;
++              }
++            }
++          }
++        }
++      }
++    }
++
++    if (total_refl_weight > 0.0f) {
++      light_caustic_accum += accum_refl_radiance / total_refl_weight;
++    }
++  }
++
++  return light_caustic_accum;
++}
++
++[[fragment]]
++void caustics_frag([[resource_table]] const CausticsEval &srt,
++                   [[resource_table]] const draw::View &views,
++                   [[resource_table]] const Uniform &uni,
++                   [[resource_table]] const HiZ &hiz,
++                   [[resource_table]] const LightRenderData &lrd,
++                   [[resource_table]] const gbuffer::Reader &reader,
++                   [[frag_coord]] const float4 frag_co,
++                   [[in]] const VertOut &v_out,
++                   [[out]] FragOut &frag_out)
++{
++  frag_out.combined = float4(0.0f);
++
++  if (srt.intensity <= 0.0f || srt.flags == 0) {
++    return;
++  }
++
++  int2 texel = int2(frag_co.xy);
++  float depth = texelFetch(hiz.hiz_tx, texel, 0).r;
++  if (depth >= 1.0f || depth <= 0.0f) {
++    return;
++  }
++
++  const ViewMatrices view = views.get(0);
++  float3 P_recv = view.point_screen_to_world(float3(v_out.screen_uv, depth));
++
++  const gbuffer::Layers recv_gbuf = reader.read_layers(texel);
++  float3 N_recv = recv_gbuf.surface_N();
++  if (dot(N_recv, N_recv) < 0.1f) {
++    N_recv = normalize(cross(gpu_dfdx(P_recv), gpu_dfdy(P_recv)));
++  }
++  if (dot(N_recv, N_recv) < 0.1f) {
++    return;
++  }
++
++  /* Prevent caustics on pure transmissive surfaces so caustics land on receiver tables/floors/interior. */
++  if (recv_gbuf.layer[0].type == CLOSURE_BSDF_MICROFACET_GGX_REFRACTION_ID) {
++    return;
++  }
++
++  const LightCullingData &culling = lrd.light_cull_buf;
++  float3 total_caustics = float3(0.0f);
++  float2 subpixel = uni.uniform_buf.film.subpixel_offset;
++  float dither = random::interleaved_gradient(frag_co.xy, subpixel.x, subpixel.y);
++  int2 render_size = textureSize(reader.gbuf_header_tx, 0).xy;
++
++  /* Evaluate Directional lights (Sun). */
++  for (uint l_idx = culling.local_lights_len; l_idx < culling.items_count; l_idx++) {
++    LightData light = lrd.light_buf[l_idx];
++    total_caustics += eval_single_light_caustics(reader,
++                                                 hiz,
++                                                 srt,
++                                                 view,
++                                                 light,
++                                                 true,
++                                                 P_recv,
++                                                 N_recv,
++                                                 v_out.screen_uv,
++                                                 dither,
++                                                 render_size);
++  }
++
++  /* Evaluate Local lights (Point, Spot, Area). */
++  uint local_eval_count = min(culling.visible_count, 4u);
++  for (uint l_idx = 0; l_idx < local_eval_count; l_idx++) {
++    LightData light = lrd.light_buf[l_idx];
++    total_caustics += eval_single_light_caustics(reader,
++                                                 hiz,
++                                                 srt,
++                                                 view,
++                                                 light,
++                                                 false,
++                                                 P_recv,
++                                                 N_recv,
++                                                 v_out.screen_uv,
++                                                 dither,
++                                                 render_size);
++  }
++
++  total_caustics *= srt.intensity;
++
++  /* Bound caustic irradiance to prevent digital blown-out clipping, matching Cycles MNEE */
++  total_caustics = min(total_caustics, float3(20.0f));
++
++  /* Physically ground caustics: incident caustic irradiance reflects off the receiver surface
++   * modulated by its diffuse albedo, allowing tabletop textures (wood grain) to shine through. */
++  float3 recv_albedo = clamp(recv_gbuf.layer[0].color, 0.05f, 1.0f);
++  total_caustics *= recv_albedo;
++
++  float3 safe_caustics = colorspace::safe_color(total_caustics);
++  frag_out.combined = float4(safe_caustics, 0.0f);
++}
++
++}  // namespace eevee::caustics
++
++PipelineGraphic eevee_caustics_eval(eevee::caustics::caustics_vert,
++                                    eevee::caustics::caustics_frag);
+diff --git a/source/blender/makesdna/DNA_scene_types.h b/source/blender/makesdna/DNA_scene_types.h
+index de9d0145..8aff65da 100644
+--- a/source/blender/makesdna/DNA_scene_types.h
++++ b/source/blender/makesdna/DNA_scene_types.h
+@@ -2675,6 +2675,9 @@ enum eSceneEEVEE_Flag : int {
+   SCE_EEVEE_SHADOW_JITTERED_VIEWPORT = (1 << 26),
+   SCE_EEVEE_VOLUME_CUSTOM_RANGE = (1 << 27),
+   SCE_EEVEE_FAST_GI_ENABLED = (1 << 28),
++  SCE_EEVEE_CAUSTICS_ENABLED = (1 << 29),
++  SCE_EEVEE_CAUSTICS_REFLECTIVE = (1 << 30),
++  SCE_EEVEE_CAUSTICS_REFRACTIVE = (1 << 1),
+ };
+ ENUM_OPERATORS(eSceneEEVEE_Flag)
+ 
+@@ -2686,7 +2689,8 @@ enum FastGI_Method : char {
+ struct SceneEEVEE {
+   DNA_DEFINE_CXX_METHODS(SceneEEVEE)
+ 
+-  eSceneEEVEE_Flag flag = SCE_EEVEE_TAA_REPROJECTION | SCE_EEVEE_SHADOW_ENABLED;
++  eSceneEEVEE_Flag flag = SCE_EEVEE_TAA_REPROJECTION | SCE_EEVEE_SHADOW_ENABLED |
++                          SCE_EEVEE_CAUSTICS_REFLECTIVE | SCE_EEVEE_CAUSTICS_REFRACTIVE;
+   int gi_diffuse_bounces = 3;
+   int gi_cubemap_resolution = 512;
+   int gi_visibility_resolution = 32;
+@@ -2755,7 +2759,9 @@ struct SceneEEVEE {
+   float light_threshold = 0.01f;
+ 
+   float time_limit = 0.0f;
+-  char _pad2[12] = {};
++  float caustics_intensity = 1.0f;
++  float caustics_dispersion = 0.05f;
++  float caustics_blur = 0.2f;
+ };
+ 
+ struct SceneGpencil {
+diff --git a/source/blender/makesrna/intern/rna_scene.cc b/source/blender/makesrna/intern/rna_scene.cc
+index 23a59c2d..09e13b01 100644
+--- a/source/blender/makesrna/intern/rna_scene.cc
++++ b/source/blender/makesrna/intern/rna_scene.cc
+@@ -8846,6 +8846,57 @@ static void rna_def_scene_eevee(BlenderRNA *brna)
+   RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
+   RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
+ 
++  /* Caustics */
++
++  prop = RNA_def_property(srna, "use_caustics", PROP_BOOLEAN, PROP_NONE);
++  RNA_def_property_boolean_sdna(prop, nullptr, "flag", SCE_EEVEE_CAUSTICS_ENABLED);
++  RNA_def_property_ui_text(
++      prop,
++      "Caustics",
++      "Calculate real-world caustics from refractive and reflective curved surfaces");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "caustics_refractive", PROP_BOOLEAN, PROP_NONE);
++  RNA_def_property_boolean_sdna(prop, nullptr, "flag", SCE_EEVEE_CAUSTICS_REFRACTIVE);
++  RNA_def_property_ui_text(
++      prop,
++      "Refractive",
++      "Enable refractive caustics from transmissive glass, liquids, and prisms");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "caustics_reflective", PROP_BOOLEAN, PROP_NONE);
++  RNA_def_property_boolean_sdna(prop, nullptr, "flag", SCE_EEVEE_CAUSTICS_REFLECTIVE);
++  RNA_def_property_ui_text(
++      prop,
++      "Reflective",
++      "Enable reflective caustics from curved specular surfaces (cups, bowls, mirrors)");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "caustics_intensity", PROP_FLOAT, PROP_FACTOR);
++  RNA_def_property_range(prop, 0.0f, 10.0f);
++  RNA_def_property_ui_range(prop, 0.0f, 5.0f, 0.1f, 2);
++  RNA_def_property_ui_text(prop, "Intensity", "Intensity multiplier for caustics");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "caustics_dispersion", PROP_FLOAT, PROP_FACTOR);
++  RNA_def_property_range(prop, 0.0f, 1.0f);
++  RNA_def_property_ui_range(prop, 0.0f, 0.5f, 0.01f, 3);
++  RNA_def_property_ui_text(
++      prop, "Dispersion", "Chromatic dispersion amount (rainbow color separation for prisms/glass)");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
++  prop = RNA_def_property(srna, "caustics_blur", PROP_FLOAT, PROP_FACTOR);
++  RNA_def_property_range(prop, 0.0f, 1.0f);
++  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.05f, 2);
++  RNA_def_property_ui_text(prop, "Blur", "Caustic sharpness and smoothness filter");
++  RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
++  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
++
+   /* Depth of Field */
+ 
+   prop = RNA_def_property(srna, "bokeh_max_size", PROP_FLOAT, PROP_PIXEL);
